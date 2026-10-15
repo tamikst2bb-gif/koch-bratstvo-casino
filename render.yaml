@@ -2,14 +2,10 @@ services:
   - type: web
     name: koch-bratstvo-casino-api
     runtime: python
-    plan: starter
+    plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     healthCheckPath: /
-    disk:
-      name: casino-data
-      mountPath: /var/data
-      sizeGB: 1
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -18,4 +14,4 @@ services:
       - key: ALLOWED_ORIGIN
         value: https://casino-koch-bratstvo.spunkyprawn.chatgpt.site
       - key: DB_PATH
-        value: /var/data/leaderboard.db
+        value: /tmp/leaderboard.db
