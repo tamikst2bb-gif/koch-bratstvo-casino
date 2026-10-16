@@ -12,14 +12,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qsl, urlparse, parse_qs
 
 import telebot
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
+from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, WebAppInfo
 
 # ====================== НАСТРОЙКИ ======================
 # Токен берётся из переменной окружения BOT_TOKEN.
 # НЕ вписывай его в код: файл лежит на GitHub.
 TOKEN = os.environ.get("BOT_TOKEN", "")
-BASE_WEB_APP_URL = (os.environ.get("BASE_WEB_APP_URL") or "https://casino-koch-bratstvo.spunkyprawn.chatgpt.site").rstrip("/")
-ALLOWED_ORIGIN = os.environ.get("ALLOWED_ORIGIN", "")
+BASE_WEB_APP_URL = (os.environ.get("BASE_WEB_APP_URL") or "").rstrip("/")
+ALLOWED_ORIGIN = (os.environ.get("ALLOWED_ORIGIN") or "*").rstrip("/")
 OWNER_ID = 778573280
 PORT = int(os.environ.get("PORT", 10000))
 DB_PATH = os.environ.get("DB_PATH", "leaderboard.db")
@@ -49,7 +49,9 @@ db.execute(
         cases INTEGER DEFAULT 0,
         level INTEGER DEFAULT 1,
         seen INTEGER DEFAULT 0,
-        profile TEXT
+        profile TEXT,
+        sync_client TEXT DEFAULT '',
+        sync_seq INTEGER DEFAULT 0
     )"""
 )
 db.execute(
@@ -69,6 +71,12 @@ try:
     db.commit()
 except sqlite3.OperationalError:
     pass
+for _column, _definition in (("ban_until", "INTEGER DEFAULT 0"), ("ban_reason", "TEXT DEFAULT ''"), ("ban_starts_at", "INTEGER DEFAULT 0")):
+    try:
+        db.execute("ALTER TABLE players ADD COLUMN %s %s" % (_column, _definition))
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
 
 TOUR_INTERVAL = 300      # новый матч каждые 5 минут
 TOUR_ODDS = 1.9          # выплата за угадавшего победителя
@@ -227,22 +235,22 @@ if not db.execute("SELECT 1 FROM meta WHERE k=?", ("reset_" + RESET_VERSION,)).f
     db.execute("INSERT INTO meta (k,v) VALUES (?,?)", ("reset_" + RESET_VERSION, str(int(time.time()))))
     db.commit()
     print("Сброс всех игроков выполнен:", RESET_VERSION)
-for _col in ("strikes", "bonus", "nwbase", "nwts"):
+for _col in ("strikes", "bonus", "nwbase", "nwts", "state_rev", "last_balance"):
     try:
         db.execute(f"ALTER TABLE players ADD COLUMN {_col} INTEGER DEFAULT 0")
         db.commit()
     except sqlite3.OperationalError:
         pass
-# --- античит: лимиты на рост «чистого капитала» (баланс + стоимость скинов) ---
-STEP_MULT = 25        # за одну синхронизацию капитал может вырасти максимум в 25 раз ...
-STEP_FLAT = 20_000    # ... плюс эта сумма
-PER_SEC = 50          # ... плюс столько монет за каждую прошедшую секунду (до часа)
-HOUR_MULT = 60        # за час максимум в 60 раз от капитала на начало часа ...
-HOUR_FLAT = 100_000   # ... плюс эта сумма
-MAX_STRIKES = 3       # после 3 нарушений игрок скрывается из рейтинга
+for _col, _type in (("sync_client", "TEXT DEFAULT ''"), ("sync_seq", "INTEGER DEFAULT 0")):
+    try:
+        db.execute(f"ALTER TABLE players ADD COLUMN {_col} {_type}")
+        db.commit()
+    except sqlite3.OperationalError:
+        pass
+db.execute("UPDATE players SET last_balance=balance WHERE last_balance=0 AND balance>0")
+db.commit()
 START_BAL = 10_000
-ADMIN_CMDS = {"bal", "set", "item", "case", "clear"}
-JUMP_LIMIT = 3_000_000  # подозрительный скачок баланса между синхронизациями
+ADMIN_CMDS = {"bal", "set", "item", "case", "clear", "warn", "maintenance", "ban", "unban"}
 
 # ---------------------- БАТТЛЫ (комнаты живут только в памяти) ----------------------
 battle_lock = threading.Lock()
@@ -251,6 +259,8 @@ battle_rooms = {}
 
 # ---------------------- ЧАТ / ТРЕЙДЫ / КЛУБЫ ----------------------
 db.execute("CREATE TABLE IF NOT EXISTS chat (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, name TEXT, text TEXT, ts INTEGER)")
+db.execute("CREATE TABLE IF NOT EXISTS player_activity (uid INTEGER PRIMARY KEY, name TEXT, game TEXT DEFAULT '', updated INTEGER DEFAULT 0)")
+db.execute("CREATE TABLE IF NOT EXISTS player_wins (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, name TEXT, game TEXT, amount INTEGER, ts INTEGER)")
 db.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, from_uid INTEGER, to_uid INTEGER, give TEXT, want TEXT, status TEXT DEFAULT 'pending', ts INTEGER)")
 db.execute("CREATE TABLE IF NOT EXISTS clubs (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT COLLATE NOCASE UNIQUE, tag TEXT, emblem TEXT, owner INTEGER, members TEXT, ts INTEGER)")
 db.commit()
@@ -290,13 +300,25 @@ def get_board():
         online = db.execute(
             "SELECT COUNT(*) FROM players WHERE seen > ?", (now - ONLINE_WINDOW,)
         ).fetchone()[0]
+        online_rows = db.execute(
+            "SELECT name,username,photo,seen FROM players WHERE seen > ? ORDER BY seen DESC LIMIT 40",
+            (now - ONLINE_WINDOW,),
+        ).fetchall()
 
         def top(col):
-            rows = db.execute(
-                f"SELECT uid,name,username,photo,balance,cases,level,seen,profile "
-                f"FROM players WHERE {col} > 0 AND susp = 0 ORDER BY {col} DESC, uid ASC LIMIT ?",
-                (TOP_N,),
-            ).fetchall()
+            if col == "balance":
+                rows = db.execute(
+                    "SELECT uid,name,username,photo,balance,cases,level,seen,profile,last_balance "
+                    "FROM players WHERE (balance>0 OR last_balance>0) AND susp=0 "
+                    "ORDER BY CASE WHEN seen>? THEN balance ELSE COALESCE(NULLIF(last_balance,0),balance) END DESC, uid ASC LIMIT ?",
+                    (now - ONLINE_WINDOW, TOP_N),
+                ).fetchall()
+            else:
+                rows = db.execute(
+                    f"SELECT uid,name,username,photo,balance,cases,level,seen,profile,0 "
+                    f"FROM players WHERE {col} > 0 AND susp = 0 ORDER BY {col} DESC, uid ASC LIMIT ?",
+                    (TOP_N,),
+                ).fetchall()
             out = []
             for r in rows:
                 try:
@@ -310,6 +332,7 @@ def get_board():
                         "username": r[2],
                         "photo": r[3],
                         "balance": r[4],
+                        "last_balance": r[9] or r[4],
                         "cases": r[5],
                         "level": r[6],
                         "online": r[7] > now - ONLINE_WINDOW,
@@ -319,11 +342,29 @@ def get_board():
                 )
             return out
 
-        data = {"money": top("balance"), "cases": top("cases")}
+        data = {
+            "money": top("balance"),
+            "cases": top("cases"),
+            "players_online": [
+                {"name": r[0] or "Игрок", "username": r[1] or "", "photo": r[2] or "", "seen": r[3]}
+                for r in online_rows
+            ],
+        }
     data["total"] = total
     data["online"] = online
     data["ts"] = now
     return data
+
+
+def get_maintenance():
+    now = int(time.time())
+    with db_lock:
+        row = db.execute("SELECT v FROM meta WHERE k='maintenance'").fetchone()
+    try:
+        starts_at = int(json.loads(row[0]).get("startsAt", 0)) if row else 0
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        starts_at = 0
+    return {"startsAt": starts_at, "scheduled": starts_at > now, "active": starts_at > 0 and starts_at <= now, "serverTime": now}
 
 
 def get_rank(uid):
@@ -390,6 +431,14 @@ def clean_profile(p):
             )
         except Exception:
             continue
+    favorite_cases = []
+    raw_favorite_cases = p.get("favoriteCases")
+    if not isinstance(raw_favorite_cases, list):
+        raw_favorite_cases = []
+    for case_id in raw_favorite_cases[:10]:
+        case_id = to_str(case_id, 48)
+        if case_id and case_id not in favorite_cases:
+            favorite_cases.append(case_id)
     return {
         "title": to_str(p.get("title"), 24),
         "frame": to_str(p.get("frame"), 4),
@@ -405,6 +454,8 @@ def clean_profile(p):
         "invCount": to_int(p.get("invCount"), 0, 10 ** 7),
         "invValue": to_int(p.get("invValue")),
         "inv": inv,
+        "favoriteCases": favorite_cases,
+        "clickPower": to_int(p.get("clickPower"), 1, 100),
     }
 
 
@@ -449,6 +500,30 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlparse(self.path)
+        if url.path in ("/", "/index.html"):
+            page = os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.html")
+            try:
+                with open(page, "rb") as f:
+                    body = f.read()
+            except OSError:
+                return self._json({"error": "casino page is missing"}, 503)
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        if url.path == "/healthz":
+            body = b"ok"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
         if url.path == "/api/stream":
             return self._stream()
         if url.path == "/api/skinimgs":
@@ -476,8 +551,17 @@ class Handler(BaseHTTPRequestHandler):
                 rows = db.execute("SELECT id,uid,name,text,ts FROM chat ORDER BY id DESC LIMIT 40").fetchall()
             rows.reverse()
             return self._json({"messages": [{"id": r[0], "uid": r[1], "name": r[2], "text": r[3], "ts": r[4]} for r in rows]})
+        if url.path == "/api/activity":
+            now = int(time.time())
+            with db_lock:
+                active = db.execute("SELECT uid,name,game,updated FROM player_activity WHERE updated>? AND game<>'' ORDER BY updated DESC LIMIT 30", (now - ONLINE_WINDOW,)).fetchall()
+                wins = db.execute("SELECT uid,name,game,amount,ts FROM player_wins WHERE ts>? ORDER BY ts DESC,id DESC LIMIT 25", (now - 24 * 3600,)).fetchall()
+            return self._json({"players": [{"id": r[0], "name": r[1] or "Игрок", "game": r[2], "updated": r[3]} for r in active],
+                               "wins": [{"id": r[0], "name": r[1] or "Игрок", "game": r[2], "amount": r[3], "ts": r[4]} for r in wins]})
         if url.path == "/api/board":
             return self._json(get_board())
+        if url.path == "/api/maintenance":
+            return self._json({"ok": True, **get_maintenance()})
         if url.path == "/api/tour":
             return self._json(get_tour())
         if url.path == "/api/war":
@@ -489,18 +573,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 return self._json({"error": "bad id"}, 400)
             return self._player(uid)
-        # health-check для Render / пингера
-        body = b"Bot is alive and running!"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        if url.path.startswith("/api/"):
+            return self._json({"error": "not found"}, 404)
+        self.send_error(404, "Not found")
 
     def _player(self, uid):
         now = int(time.time())
         with db_lock:
             r = db.execute(
-                "SELECT uid,name,username,photo,balance,cases,level,seen,profile "
+                "SELECT uid,name,username,photo,balance,cases,level,seen,profile,last_balance "
                 "FROM players WHERE uid=?",
                 (uid,),
             ).fetchone()
@@ -518,6 +599,7 @@ class Handler(BaseHTTPRequestHandler):
                 "username": r[2],
                 "photo": r[3],
                 "balance": r[4],
+                "last_balance": r[9] or r[4],
                 "cases": r[5],
                 "level": r[6],
                 "online": r[7] > now - ONLINE_WINDOW,
@@ -529,11 +611,11 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = urlparse(self.path).path
-        if path not in ("/api/sync", "/api/admin", "/api/grants", "/api/grants/ack", "/api/skinimg",
+        if path not in ("/api/sync", "/api/admin", "/api/grants", "/api/grants/ack", "/api/skinimg", "/api/ban/status",
                         "/api/battle/join", "/api/battle/poll", "/api/battle/cancel",
                         "/api/battle/online", "/api/battle/invite", "/api/battle/invites",
                         "/api/battle/accept", "/api/battle/status", "/api/battle/decline",
-                        "/api/chat/send",
+                        "/api/chat/send", "/api/activity",
                         "/api/tour/bet",
                         "/api/trades/create", "/api/trades/list", "/api/trades/accept", "/api/trades/decline",
                         "/api/clubs/create", "/api/clubs/join", "/api/clubs/leave", "/api/clubs/list", "/api/clubs/mine"):
@@ -552,10 +634,31 @@ class Handler(BaseHTTPRequestHandler):
         user = verify_init_data(str(data.get("initData", "")))
         if not user:
             return self._json({"error": "auth"}, 401)
+        uid = int(user["id"])
+        if path == "/api/ban/status":
+            if uid == OWNER_ID:
+                return self._json({"ok": True, "banned": False})
+            now = int(time.time())
+            with db_lock:
+                row = db.execute("SELECT banned,ban_until,ban_reason,ban_starts_at FROM players WHERE uid=?", (uid,)).fetchone()
+                if row and row[0] and row[1] and int(row[1]) <= now:
+                    db.execute("UPDATE players SET banned=0,ban_until=0,ban_reason='',ban_starts_at=0 WHERE uid=?", (uid,))
+                    db.commit()
+                    row = (0, 0, "", 0)
+            active = bool(row and row[0] and int(row[3] or 0) <= now)
+            return self._json({"ok": True, "banned": active,
+                               "pending": bool(row and row[0] and int(row[3] or 0) > now),
+                               "startsAt": int(row[3] or 0) if row and row[0] else 0,
+                               "reason": (row[2] or "") if active else "",
+                               "until": int(row[1] or 0) if active else 0})
         with db_lock:
-            _bn = db.execute("SELECT banned FROM players WHERE uid=?", (int(user["id"]),)).fetchone()
-        if _bn and _bn[0]:
-            return self._json({"error": "banned"}, 403)
+            _bn = db.execute("SELECT banned,ban_until,ban_reason,ban_starts_at FROM players WHERE uid=?", (uid,)).fetchone()
+            if uid != OWNER_ID and _bn and _bn[0] and _bn[1] and int(_bn[1]) <= int(time.time()):
+                db.execute("UPDATE players SET banned=0,ban_until=0,ban_reason='',ban_starts_at=0 WHERE uid=?", (uid,))
+                db.commit()
+                _bn = (0, 0, "", 0)
+        if uid != OWNER_ID and _bn and _bn[0] and int(_bn[3] or 0) <= int(time.time()):
+            return self._json({"error": "banned", "reason": _bn[2] or "", "until": int(_bn[1] or 0)}, 403)
         if path == "/api/skinimg":
             if int(user["id"]) != OWNER_ID:
                 return self._json({"error": "forbidden"}, 403)
@@ -568,6 +671,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._admin(data)
         if path in ("/api/grants", "/api/grants/ack"):
             return self._grants(int(user["id"]), path, data)
+        if path == "/api/activity":
+            return self._activity(user, data)
         if path == "/api/chat/send":
             return self._chat_send(user, data)
         if path.startswith("/api/trades/"):
@@ -599,6 +704,27 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True})
 
         uid = int(user["id"])
+        # При открытии мини-приложения сначала читаем авторитетное состояние.
+        # Не принимаем локальный снимок браузера до завершения этой загрузки:
+        # localStorage может быть пустым или устаревшим на новом устройстве.
+        if path == "/api/sync" and data.get("mode") == "load":
+            with db_lock:
+                saved = db.execute(
+                    "SELECT balance,cases,level,profile,state_rev FROM players WHERE uid=?", (uid,)
+                ).fetchone()
+            if saved:
+                try:
+                    saved_profile = json.loads(saved[3]) if saved[3] else {}
+                except Exception:
+                    saved_profile = {}
+                return self._json({
+                    "ok": True, "exists": True, "balance": saved[0], "cases": saved[1],
+                    "level": saved[2], "profile": saved_profile, "state_rev": saved[4] or 0,
+                })
+            return self._json({
+                "ok": True, "exists": False, "balance": START_BAL, "cases": 0,
+                "level": 1, "profile": {}, "state_rev": 0,
+            })
         name = to_str(user.get("first_name") or user.get("username") or "Игрок", 40)
         username = to_str(user.get("username"), 40)
         photo = to_str(user.get("photo_url"), 300)
@@ -609,45 +735,38 @@ class Handler(BaseHTTPRequestHandler):
         level = to_int(data.get("level"), 1, 10 ** 4)
         pdict = clean_profile(data.get("profile") or {})
         prof = json.dumps(pdict, ensure_ascii=False)
-        new_nw = balance + sum(i[3] for i in pdict["inv"])
         now = int(time.time())
 
         with db_lock:
             row = db.execute(
-                "SELECT balance,profile,seen,strikes,bonus,nwbase,nwts FROM players WHERE uid=?",
+                "SELECT balance,profile,bonus,state_rev,sync_client,sync_seq FROM players WHERE uid=?",
                 (uid,),
             ).fetchone()
+            client_id = to_str(data.get("clientId"), 80)
+            client_seq = to_int(data.get("clientSeq"), 0, 2 ** 63 - 1)
             if row:
-                try:
-                    op = json.loads(row[1]) if row[1] else {}
-                except Exception:
-                    op = {}
-                old_inv = op.get("inv") or []
-                old_bal = row[0]
-                old_nw = old_bal + sum(i[3] for i in old_inv)
-                elapsed = max(0, min(now - (row[2] or now), 3600))
-                strikes, bonus, base, bts = row[3] or 0, row[4] or 0, row[5] or 0, row[6] or 0
+                # Защита от двух открытых WebView: устаревший снимок не должен
+                # затирать состояние другой сессии. Более новый снимок того же
+                # клиента разрешён: например, финальный sendBeacon при закрытии
+                # страницы мог обогнать запрос, начатый до последней ставки.
+                base_rev = to_int(data.get("baseRev"), 0, 2 ** 63 - 1)
+                same_client_newer = bool(client_id and client_id == (row[4] or "") and client_seq > (row[5] or 0))
+                if "baseRev" in data and base_rev != (row[3] or 0) and not same_client_newer:
+                    try:
+                        saved_profile = json.loads(row[1]) if row[1] else {}
+                    except Exception:
+                        saved_profile = {}
+                    return self._json({
+                        "ok": False, "revert": True, "balance": row[0],
+                        "inv": saved_profile.get("inv", []),
+                        "favoriteCases": saved_profile.get("favoriteCases", []),
+                        "state_rev": row[3] or 0,
+                    })
+                bonus = row[2] or 0
+                if not client_id:
+                    client_id, client_seq = row[4] or "", row[5] or 0
             else:
-                old_inv, old_bal, old_nw = [], START_BAL, START_BAL
-                elapsed, strikes, bonus, base, bts = 0, 0, 0, START_BAL, now
-            if now - bts > 3600 or base <= 0:
-                base, bts = max(old_nw, 1), now
-            step_cap = max(old_nw, 0) * STEP_MULT + STEP_FLAT + elapsed * PER_SEC
-            hour_cap = base * HOUR_MULT + HOUR_FLAT
-            over = new_nw > min(step_cap, hour_cap)
-            if over and new_nw > min(step_cap, hour_cap) + bonus and uid != OWNER_ID:
-                # накрутка: откатываем игрока к последнему честному состоянию
-                if row:
-                    strikes += 1
-                    db.execute(
-                        "UPDATE players SET seen=?, strikes=?, susp=CASE WHEN ?>=? THEN 1 ELSE susp END WHERE uid=?",
-                        (now, strikes, strikes, MAX_STRIKES, uid),
-                    )
-                    db.commit()
-                return self._json(
-                    {"ok": False, "revert": True, "balance": old_bal, "inv": old_inv[:200]}
-                )
-            old = (old_bal,) if row else None
+                bonus = 0
             # очки клан-войны: сколько кейсов открыл игрок с прошлой синхронизации
             try:
                 _oc = db.execute("SELECT cases FROM players WHERE uid=?", (uid,)).fetchone()
@@ -655,22 +774,24 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             db.execute(
-                """INSERT INTO players (uid,name,username,photo,balance,cases,level,seen,profile)
-                   VALUES (?,?,?,?,?,?,?,?,?)
+                """INSERT INTO players (uid,name,username,photo,balance,cases,level,seen,profile,sync_client,sync_seq)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(uid) DO UPDATE SET
                      name=excluded.name, username=excluded.username, photo=excluded.photo,
                      balance=excluded.balance, cases=excluded.cases, level=excluded.level,
-                     seen=excluded.seen, profile=excluded.profile""",
-                (uid, name, username, photo, balance, cases, level, now, prof),
+                     seen=excluded.seen, profile=excluded.profile,
+                     sync_client=excluded.sync_client, sync_seq=excluded.sync_seq,
+                     state_rev=players.state_rev+1""",
+                (uid, name, username, photo, balance, cases, level, now, prof, client_id, client_seq),
             )
             db.execute(
-                "UPDATE players SET bonus=?, nwbase=?, nwts=? WHERE uid=?", (0 if over else bonus, base, bts, uid)
+                "UPDATE players SET bonus=?, strikes=0, susp=0, "
+                "last_balance=CASE WHEN balance>0 THEN balance ELSE last_balance END WHERE uid=?",
+                (bonus, uid)
             )
-            if old and uid != OWNER_ID and balance - old[0] > JUMP_LIMIT + bonus:
-                db.execute("UPDATE players SET susp=1 WHERE uid=?", (uid,))
             db.commit()
         bump_version()
-        self._json({"ok": True, "rank": get_rank(uid)})
+        self._json({"ok": True, "rank": get_rank(uid), "state_rev": (row[3] or 0) + 1 if row else 0})
 
     def _skinimg(self, data):
         k = to_str(data.get("k"), 120)
@@ -705,10 +826,77 @@ class Handler(BaseHTTPRequestHandler):
         t = cmd.get("t")
         if t not in ADMIN_CMDS:
             return self._json({"error": "bad cmd"}, 400)
+        if t in ("ban", "unban"):
+            target = to_int(cmd.get("to"), 0, 10 ** 15)
+            if not target:
+                return self._json({"error": "укажи Telegram ID игрока"}, 400)
+            if target == OWNER_ID:
+                return self._json({"error": "нельзя заблокировать владельца"}, 400)
+            now = int(time.time())
+            with db_lock:
+                if t == "ban":
+                    seconds = to_int(cmd.get("seconds"), 10, 86400)
+                    reason = to_str(cmd.get("reason"), 500).strip()
+                    if not reason:
+                        return self._json({"error": "укажи причину бана"}, 400)
+                    starts_at = now + 3
+                    until = starts_at + seconds
+                    db.execute(
+                        "INSERT INTO players (uid,banned,ban_until,ban_reason,ban_starts_at) VALUES (?,1,?,?,?) "
+                        "ON CONFLICT(uid) DO UPDATE SET banned=1,ban_until=excluded.ban_until,ban_reason=excluded.ban_reason,ban_starts_at=excluded.ban_starts_at",
+                        (target, until, reason, starts_at),
+                    )
+                    notice = f"🔨 Бан для игрока {target} начнётся через 3 секунды на срок {seconds} сек. Причина: {reason}"
+                    db.execute(
+                        "INSERT INTO grants (uid,kind,data,created) VALUES (?,?,?,?)",
+                        (OWNER_ID, "notice", json.dumps({"t": "notice", "message": notice}, ensure_ascii=False), now),
+                    )
+                else:
+                    db.execute("UPDATE players SET banned=0,ban_until=0,ban_reason='',ban_starts_at=0 WHERE uid=?", (target,))
+                    until = 0
+                db.commit()
+            bump_version()
+            return self._json({"ok": True, "target": target, "until": until})
+        if t == "maintenance":
+            mode = to_str(cmd.get("mode"), 10)
+            if mode not in ("start", "stop"):
+                return self._json({"error": "bad maintenance mode"}, 400)
+            starts_at = int(time.time()) + 10 if mode == "start" else 0
+            with db_lock:
+                db.execute(
+                    "INSERT INTO meta (k,v) VALUES ('maintenance',?) "
+                    "ON CONFLICT(k) DO UPDATE SET v=excluded.v",
+                    (json.dumps({"startsAt": starts_at}),),
+                )
+                db.commit()
+            bump_version()
+            return self._json({"ok": True, **get_maintenance()})
         to = cmd.pop("to", None)
         clean = {"t": t}
+        if t == "warn":
+            target = to_int(to, 0, 10 ** 15)
+            message = to_str(cmd.get("message"), 500).strip()
+            if not target or to == "all":
+                return self._json({"error": "укажи Telegram ID одного игрока"}, 400)
+            if not message:
+                return self._json({"error": "впиши текст предупреждения"}, 400)
+            clean["message"] = message
+            now = int(time.time())
+            with db_lock:
+                db.execute(
+                    "INSERT INTO grants (uid,kind,data,created) VALUES (?,?,?,?)",
+                    (target, t, json.dumps(clean, ensure_ascii=False), now),
+                )
+                db.commit()
+            bump_version()
+            return self._json({"ok": True, "count": 1, "target": target})
         if t in ("bal", "set"):
             clean["v"] = to_int(cmd.get("v"), -10 ** 12, 10 ** 12)
+        target_uid = to_int(to, 0, 10 ** 15)
+        if target_uid > 0 and target_uid != OWNER_ID and (
+            (t == "bal" and clean.get("v", 0) > 0) or t in ("item", "case")
+        ):
+            clean["notify_owner"] = True
         if t == "item":
             clean["item"] = to_str(cmd.get("item"), 100)
         if t == "case":
@@ -839,14 +1027,71 @@ class Handler(BaseHTTPRequestHandler):
     def _grants(self, uid, path, data):
         with db_lock:
             if path == "/api/grants/ack":
+                if data.get("delivered") is True:
+                    ids = list(dict.fromkeys(to_int(x, 0, 10 ** 9) for x in (data.get("ids") or [])[:100]))
+                    ids = [grant_id for grant_id in ids if grant_id]
+                    if not ids:
+                        return self._json({"ok": True, "delivered": 0})
+                    rows = db.execute(
+                        "SELECT id FROM grants WHERE uid=? AND done=0 AND id IN (%s) AND kind='warn'"
+                        % ",".join("?" * len(ids)),
+                        [uid] + ids,
+                    ).fetchall()
+                    confirmed = [row[0] for row in rows]
+                    if confirmed:
+                        db.execute(
+                            "UPDATE grants SET done=1 WHERE uid=? AND kind='warn' AND id IN (%s)"
+                            % ",".join("?" * len(confirmed)),
+                            [uid] + confirmed,
+                        )
+                        if uid != OWNER_ID:
+                            now = int(time.time())
+                            message = f"⚠️ Первое предупреждение доставлено игроку {uid}."
+                            db.execute(
+                                "INSERT INTO grants (uid,kind,data,created) VALUES (?,?,?,?)",
+                                (OWNER_ID, "notice", json.dumps({"t": "notice", "message": message}, ensure_ascii=False), now),
+                            )
+                        db.commit()
+                    return self._json({"ok": True, "delivered": len(confirmed)})
+                if data.get("synced") is not True:
+                    return self._json({"ok": False, "error": "sync confirmation required"}, 409)
                 ids = [to_int(x, 0, 10 ** 9) for x in (data.get("ids") or [])[:100]]
                 if ids:
+                    rows = db.execute(
+                        "SELECT id,data FROM grants WHERE uid=? AND done=0 AND id IN (%s)" % ",".join("?" * len(ids)),
+                        [uid] + ids,
+                    ).fetchall()
+                    confirmed = []
+                    for row_id, raw in rows:
+                        try:
+                            grant = json.loads(raw)
+                            if not grant.get("notify_owner") or uid == OWNER_ID:
+                                continue
+                            kind = grant.get("t")
+                            if kind == "bal" and int(grant.get("v", 0)) > 0:
+                                message = f"✅ Игрок {uid} получил {int(grant['v']):,} монет на баланс.".replace(",", " ")
+                            elif kind == "case":
+                                message = f"✅ Игрок {uid} получил кейсы: {to_str(grant.get('case'), 40)} ×{to_int(grant.get('n'), 1, 500)}."
+                            elif kind == "item":
+                                message = f"✅ Игрок {uid} получил скин: {to_str(grant.get('item'), 100)} ×{to_int(grant.get('n'), 1, 500)}."
+                            else:
+                                continue
+                            confirmed.append((row_id, message))
+                        except (ValueError, TypeError, json.JSONDecodeError):
+                            continue
                     db.execute(
                         "UPDATE grants SET done=1 WHERE uid=? AND id IN (%s)" % ",".join("?" * len(ids)),
                         [uid] + ids,
                     )
+                    if uid != OWNER_ID:
+                        now = int(time.time())
+                        for row_id, message in confirmed:
+                            db.execute(
+                                "INSERT INTO grants (uid,kind,data,created) VALUES (?,?,?,?)",
+                                (OWNER_ID, "notice", json.dumps({"t": "notice", "message": message}, ensure_ascii=False), now),
+                            )
                     db.commit()
-                return self._json({"ok": True})
+                return self._json({"ok": True, "confirmed": len(ids)})
             rows = db.execute(
                 "SELECT id,data FROM grants WHERE uid=? AND done=0 ORDER BY id LIMIT 50", (uid,)
             ).fetchall()
@@ -859,6 +1104,27 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         self._json({"grants": out})
+
+    def _activity(self, user, data):
+        uid = int(user["id"])
+        name = to_str(user.get("first_name") or user.get("username") or "Игрок", 30)
+        game = to_str(data.get("game"), 48).strip()
+        now = int(time.time())
+        win = data.get("win") if isinstance(data.get("win"), dict) else None
+        amount = to_int(win.get("amount"), 0, MAX_BALANCE) if win else 0
+        win_game = to_str((win or {}).get("game") or game or "Игра", 48).strip()
+        with db_lock:
+            db.execute(
+                "INSERT INTO player_activity(uid,name,game,updated) VALUES(?,?,?,?) "
+                "ON CONFLICT(uid) DO UPDATE SET name=excluded.name,game=excluded.game,updated=excluded.updated",
+                (uid, name, game, now),
+            )
+            if amount > 0:
+                db.execute("INSERT INTO player_wins(uid,name,game,amount,ts) VALUES(?,?,?,?,?)",
+                           (uid, name, win_game, amount, now))
+                db.execute("DELETE FROM player_wins WHERE id NOT IN (SELECT id FROM player_wins ORDER BY id DESC LIMIT 200)")
+            db.commit()
+        return self._json({"ok": True})
 
     def _chat_send(self, user, data):
         global chat_version, last_chat_msg
@@ -1216,7 +1482,7 @@ def cmd_ban(message):
             "INSERT INTO players (uid,name,balance) VALUES (?,?,?) ON CONFLICT(uid) DO NOTHING",
             (uid, "Игрок", START_BAL),
         )
-        db.execute("UPDATE players SET banned=1 WHERE uid=?", (uid,))
+        db.execute("UPDATE players SET banned=1,ban_until=0,ban_starts_at=0,ban_reason='Заблокировано через команду бота' WHERE uid=?", (uid,))
         db.commit()
     bot.reply_to(message, f"🔨 Игрок {uid} заблокирован.")
 
@@ -1230,11 +1496,17 @@ def cmd_unban(message):
     except Exception:
         return bot.reply_to(message, "Использование: /unban ID_игрока")
     with db_lock:
-        db.execute("UPDATE players SET banned=0 WHERE uid=?", (uid,))
+        db.execute("UPDATE players SET banned=0,ban_until=0,ban_starts_at=0,ban_reason='' WHERE uid=?", (uid,))
         db.commit()
     bot.reply_to(message, f"✅ Игрок {uid} разблокирован.")
 
 
 if __name__ == "__main__":
+  if BASE_WEB_APP_URL:
+    try:
+      bot.set_chat_menu_button(menu_button=MenuButtonWebApp(text="🎰 Играть", web_app=WebAppInfo(url=BASE_WEB_APP_URL)))
+      print("Кнопка открытия казино в меню Telegram обновлена.")
+    except Exception as e:
+      print(f"Не удалось обновить кнопку меню Telegram: {e}")
   print("Бот и веб-сервер запущены...")
   bot.infinity_polling()

@@ -9,9 +9,5 @@ services:
     envVars:
       - key: BOT_TOKEN
         sync: false
-      - key: BASE_WEB_APP_URL
-        value: https://casino-koch-bratstvo.spunkyprawn.chatgpt.site
-      - key: ALLOWED_ORIGIN
-        value: https://casino-koch-bratstvo.spunkyprawn.chatgpt.site
       - key: DB_PATH
         value: /tmp/leaderboard.db
